@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use smallvec::smallvec;
@@ -9,8 +10,19 @@ use crate::indexer::merger::MAX_DOC_LIMIT;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
+use crate::postings::term_offsets_mem_usage;
 use crate::schema::document::Document;
 use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument, TantivyError};
+
+fn estimated_finalize_base_mem_usage_from_components(
+    active_mem_usage: usize,
+    doc_opstamp_capacity: usize,
+    term_count: usize,
+) -> usize {
+    active_mem_usage
+        .saturating_add(doc_opstamp_capacity.saturating_mul(size_of::<Opstamp>()))
+        .saturating_add(term_offsets_mem_usage(term_count))
+}
 
 fn panic_to_error(context: &str, panic_payload: Box<dyn Any + Send>) -> TantivyError {
     let panic_message = if let Some(message) = panic_payload.downcast_ref::<&str>() {
@@ -195,6 +207,26 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             .unwrap_or(0)
     }
 
+    /// Returns a base memory estimate for finalizing the active segment.
+    ///
+    /// The estimate adds document opstamp capacity and the term-offset array allocated during
+    /// finalization to [`Self::mem_usage`]. It deliberately does not estimate the total peak:
+    /// postings serialization buffers, term-dictionary builders, fieldnorm growth, fast/stored
+    /// fields, allocator overhead, and caller-owned batches are excluded. Callers must not use
+    /// this value as a hard memory limit without a separate workload-level bound and reserve.
+    pub fn estimated_finalize_base_mem_usage(&self) -> usize {
+        self.segment_writer
+            .as_ref()
+            .map(|segment_writer| {
+                estimated_finalize_base_mem_usage_from_components(
+                    segment_writer.mem_usage(),
+                    segment_writer.doc_opstamps.capacity(),
+                    segment_writer.ctx.term_index.len(),
+                )
+            })
+            .unwrap_or(0)
+    }
+
     pub fn finalize(mut self) -> crate::Result<Index> {
         if let Some(error) = self.first_error {
             return Err(error);
@@ -231,18 +263,20 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use super::MAX_DOC_LIMIT;
     use crate::collector::DocSetCollector;
     use crate::directory::RamDirectory;
+    use crate::postings::term_offsets_mem_usage;
     use crate::query::TermQuery;
     use crate::schema::{
         Document, IndexRecordOption, NumericOptions, Schema, Term, TextFieldIndexing, TextOptions,
         INDEXED, TEXT, TEXT_WITH_DOC_ID,
     };
     use crate::tokenizer::{Token, TokenStream, Tokenizer, TokenizerManager};
-    use crate::{doc, Index, IndexSettings, TantivyDocument, TantivyError};
+    use crate::{doc, Index, IndexSettings, Opstamp, TantivyDocument, TantivyError};
 
     const MEMORY_BUDGET: usize = 15_000_000;
 
@@ -538,6 +572,53 @@ mod tests {
         assert!(mem_usage > 0);
         writer.finalize()?;
         Ok(())
+    }
+
+    #[test]
+    fn test_estimated_finalize_base_mem_usage_includes_active_opstamps_and_finalize_terms(
+    ) -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+
+        writer.add_document(doc!(text => "alpha beta gamma"))?;
+
+        let segment_writer = writer
+            .segment_writer
+            .as_ref()
+            .expect("active writer must retain its segment writer");
+        let opstamp_bytes = segment_writer
+            .doc_opstamps
+            .capacity()
+            .saturating_mul(size_of::<Opstamp>());
+        let finalize_term_bytes = term_offsets_mem_usage(segment_writer.ctx.term_index.len());
+        let expected = segment_writer
+            .mem_usage()
+            .saturating_add(opstamp_bytes)
+            .saturating_add(finalize_term_bytes);
+
+        assert_eq!(writer.estimated_finalize_base_mem_usage(), expected);
+        assert!(writer.estimated_finalize_base_mem_usage() > writer.mem_usage());
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_estimated_finalize_base_mem_usage_saturates_component_overflow() {
+        assert_eq!(
+            super::estimated_finalize_base_mem_usage_from_components(usize::MAX, 1, 1),
+            usize::MAX
+        );
+        assert_eq!(
+            super::estimated_finalize_base_mem_usage_from_components(0, usize::MAX, 0),
+            usize::MAX
+        );
+        assert_eq!(
+            super::estimated_finalize_base_mem_usage_from_components(0, 0, usize::MAX),
+            usize::MAX
+        );
     }
 
     #[test]
