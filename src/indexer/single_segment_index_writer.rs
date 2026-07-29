@@ -12,7 +12,9 @@ use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
 use crate::postings::term_offsets_mem_usage;
 use crate::schema::document::Document;
-use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument, TantivyError};
+use crate::{
+    Directory, Index, IndexMeta, IndexSettings, Opstamp, Segment, TantivyDocument, TantivyError,
+};
 
 fn estimated_finalize_base_mem_usage_from_components(
     active_mem_usage: usize,
@@ -40,6 +42,7 @@ fn panic_to_error(context: &str, panic_payload: Box<dyn Any + Send>) -> TantivyE
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment: Segment,
+    index_settings: IndexSettings,
     segment_writer: Option<SegmentWriter>,
     first_error: Option<TantivyError>,
     next_opstamp: Opstamp,
@@ -49,11 +52,13 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn new(mut index: Index, mem_budget: usize) -> crate::Result<Self> {
+        let index_settings = index.settings().clone();
         index.settings_mut().docstore_compress_dedicated_thread = false;
         let segment = index.new_segment();
         let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         Ok(Self {
             segment,
+            index_settings,
             segment_writer: Some(segment_writer),
             first_error: None,
             next_opstamp: 0,
@@ -248,8 +253,9 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
 
         let segment: Segment = self.segment.with_max_doc(max_doc);
         let index = segment.index();
+        let index_settings = self.index_settings;
         let index_meta = IndexMeta {
-            index_settings: index.settings().clone(),
+            index_settings: index_settings.clone(),
             segments: vec![segment.meta().clone()],
             schema: index.schema(),
             opstamp: 0,
@@ -257,7 +263,9 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         };
         save_metas(&index_meta, index.directory())?;
         index.directory().sync_directory()?;
-        Ok(segment.index().clone())
+        let mut finalized_index = segment.index().clone();
+        *finalized_index.settings_mut() = index_settings;
+        Ok(finalized_index)
     }
 }
 
@@ -275,7 +283,9 @@ mod tests {
         Document, IndexRecordOption, NumericOptions, Schema, Term, TextFieldIndexing, TextOptions,
         INDEXED, TEXT, TEXT_WITH_DOC_ID,
     };
-    use crate::tokenizer::{Token, TokenStream, Tokenizer, TokenizerManager};
+    use crate::tokenizer::{
+        NgramTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer, TokenizerManager,
+    };
     use crate::{doc, Index, IndexSettings, Opstamp, TantivyDocument, TantivyError};
 
     const MEMORY_BUDGET: usize = 15_000_000;
@@ -606,6 +616,43 @@ mod tests {
     }
 
     #[test]
+    fn test_ngram_finalize_estimate_can_cross_limit_above_active_usage() -> crate::Result<()> {
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("ngram")
+                .set_fieldnorms(false)
+                .set_index_option(IndexRecordOption::Basic),
+        );
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", text_options);
+        schema_builder.enable_user_specified_doc_id();
+        let tokenizers = TokenizerManager::default();
+        let ngram_tokenizer = TextAnalyzer::builder(NgramTokenizer::new(2, 3, false)?)
+            .dynamic()
+            .build();
+        tokenizers.register("ngram", ngram_tokenizer);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .tokenizers(tokenizers)
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+
+        writer.add_documents_with_doc_ids(vec![
+            (3, doc!(text => "alphabet")),
+            (9, doc!(text => "alphanumeric")),
+        ])?;
+
+        let active_usage = writer.mem_usage();
+        let finalize_estimate = writer.estimated_finalize_base_mem_usage();
+        assert!(finalize_estimate > active_usage);
+        let soft_limit = active_usage + (finalize_estimate - active_usage) / 2;
+
+        assert!(active_usage <= soft_limit);
+        assert!(finalize_estimate > soft_limit);
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
     fn test_estimated_finalize_base_mem_usage_saturates_component_overflow() {
         assert_eq!(
             super::estimated_finalize_base_mem_usage_from_components(usize::MAX, 1, 1),
@@ -834,8 +881,6 @@ mod tests {
         let schema = schema_builder.build();
         let mut settings = IndexSettings::default();
         settings.docstore_blocksize = 4_096;
-        let mut expected_settings = settings.clone();
-        expected_settings.docstore_compress_dedicated_thread = false;
         let directory = RamDirectory::default();
         let mut writer = Index::builder()
             .schema(schema.clone())
@@ -843,13 +888,14 @@ mod tests {
             .single_segment_index_writer(directory.clone(), MEMORY_BUDGET)?;
 
         writer.add_document(doc!(text => "meta"))?;
-        writer.finalize()?;
+        let finalized_index = writer.finalize()?;
+        assert_eq!(finalized_index.settings(), &settings);
 
         let index = Index::open(directory)?;
         let meta = index.load_metas()?;
         assert_eq!(meta.segments.len(), 1);
         assert_eq!(meta.segments[0].max_doc(), 1);
-        assert_eq!(meta.index_settings, expected_settings);
+        assert_eq!(meta.index_settings, settings);
         assert_eq!(meta.schema, schema);
         assert_eq!(meta.opstamp, 0);
         assert_eq!(meta.payload, None);
