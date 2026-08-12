@@ -1,5 +1,6 @@
 use std::io;
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::ops::Range;
 
 use stacker::Addr;
@@ -16,9 +17,13 @@ use crate::DocId;
 
 const POSITION_GAP: u32 = 1;
 
-fn make_field_partition(
-    term_offsets: &[(Field, OrderedPathId, &[u8], Addr)],
-) -> Vec<(Field, Range<usize>)> {
+pub(crate) type TermOffset<'a> = (Field, OrderedPathId, &'a [u8], Addr);
+
+pub(crate) fn term_offsets_mem_usage(term_count: usize) -> usize {
+    term_count.saturating_mul(size_of::<TermOffset<'static>>())
+}
+
+fn make_field_partition(term_offsets: &[TermOffset<'_>]) -> Vec<(Field, Range<usize>)> {
     let term_offsets_it = term_offsets
         .iter()
         .map(|(field, _, _, _)| *field)
@@ -55,8 +60,7 @@ pub(crate) fn serialize_postings(
     let unordered_id_to_ordered_id: Vec<OrderedPathId> =
         ctx.path_to_unordered_id.unordered_id_to_ordered_id();
 
-    let mut term_offsets: Vec<(Field, OrderedPathId, &[u8], Addr)> =
-        Vec::with_capacity(ctx.term_index.len());
+    let mut term_offsets: Vec<TermOffset<'_>> = Vec::with_capacity(ctx.term_index.len());
     term_offsets.extend(ctx.term_index.iter().map(|(key, addr)| {
         let field = Term::wrap(key).field();
         if schema.get_field_entry(field).field_type().value_type() == Type::Json {

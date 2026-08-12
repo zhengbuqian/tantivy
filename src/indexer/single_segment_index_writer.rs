@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use smallvec::smallvec;
@@ -9,10 +10,21 @@ use crate::indexer::merger::MAX_DOC_LIMIT;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
+use crate::postings::term_offsets_mem_usage;
 use crate::schema::document::Document;
 use crate::{
     Directory, Index, IndexMeta, IndexSettings, Opstamp, Segment, TantivyDocument, TantivyError,
 };
+
+fn estimated_finalize_base_mem_usage_from_components(
+    active_mem_usage: usize,
+    doc_opstamp_capacity: usize,
+    term_count: usize,
+) -> usize {
+    active_mem_usage
+        .saturating_add(doc_opstamp_capacity.saturating_mul(size_of::<Opstamp>()))
+        .saturating_add(term_offsets_mem_usage(term_count))
+}
 
 fn panic_to_error(context: &str, panic_payload: Box<dyn Any + Send>) -> TantivyError {
     let panic_message = if let Some(message) = panic_payload.downcast_ref::<&str>() {
@@ -243,6 +255,36 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         }
     }
 
+    /// Returns the active segment writer's current memory usage estimate.
+    ///
+    /// A poisoned writer has dropped its partial segment and reports zero memory usage.
+    pub fn mem_usage(&self) -> usize {
+        self.segment_writer
+            .as_ref()
+            .map(SegmentWriter::mem_usage)
+            .unwrap_or(0)
+    }
+
+    /// Returns a base memory estimate for finalizing the active segment.
+    ///
+    /// The estimate adds document opstamp capacity and the term-offset array allocated during
+    /// finalization to [`Self::mem_usage`]. It deliberately does not estimate the total peak:
+    /// postings serialization buffers, term-dictionary builders, fieldnorm growth, fast/stored
+    /// fields, allocator overhead, and caller-owned batches are excluded. Callers must not use
+    /// this value as a hard memory limit without a separate workload-level bound and reserve.
+    pub fn estimated_finalize_base_mem_usage(&self) -> usize {
+        self.segment_writer
+            .as_ref()
+            .map(|segment_writer| {
+                estimated_finalize_base_mem_usage_from_components(
+                    segment_writer.mem_usage(),
+                    segment_writer.doc_opstamps.capacity(),
+                    segment_writer.ctx.term_index.len(),
+                )
+            })
+            .unwrap_or(0)
+    }
+
     pub fn finalize(mut self) -> crate::Result<Index> {
         if let Some(error) = self.first_error {
             return Err(error);
@@ -282,18 +324,22 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use super::MAX_DOC_LIMIT;
     use crate::collector::DocSetCollector;
     use crate::directory::RamDirectory;
+    use crate::postings::term_offsets_mem_usage;
     use crate::query::TermQuery;
     use crate::schema::{
         Document, IndexRecordOption, NumericOptions, Schema, Term, TextFieldIndexing, TextOptions,
         INDEXED, TEXT, TEXT_WITH_DOC_ID,
     };
-    use crate::tokenizer::{Token, TokenStream, Tokenizer, TokenizerManager};
-    use crate::{doc, Index, IndexSettings, TantivyDocument, TantivyError};
+    use crate::tokenizer::{
+        NgramTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer, TokenizerManager,
+    };
+    use crate::{doc, Index, IndexSettings, Opstamp, TantivyDocument, TantivyError};
 
     const MEMORY_BUDGET: usize = 15_000_000;
 
@@ -732,6 +778,104 @@ mod tests {
     }
 
     #[test]
+    fn test_mem_usage_is_updated_after_batch_is_processed() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+
+        writer.add_document(doc!(text => "some text to consume indexing memory"))?;
+        assert!(writer.mem_usage() > 0);
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_estimated_finalize_base_mem_usage_includes_active_opstamps_and_finalize_terms(
+    ) -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+
+        writer.add_document(doc!(text => "alpha beta gamma"))?;
+
+        let segment_writer = writer
+            .segment_writer
+            .as_ref()
+            .expect("active writer must retain its segment writer");
+        let opstamp_bytes = segment_writer
+            .doc_opstamps
+            .capacity()
+            .saturating_mul(size_of::<Opstamp>());
+        let finalize_term_bytes = term_offsets_mem_usage(segment_writer.ctx.term_index.len());
+        let expected = segment_writer
+            .mem_usage()
+            .saturating_add(opstamp_bytes)
+            .saturating_add(finalize_term_bytes);
+
+        assert_eq!(writer.estimated_finalize_base_mem_usage(), expected);
+        assert!(writer.estimated_finalize_base_mem_usage() > writer.mem_usage());
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_ngram_finalize_estimate_can_cross_limit_above_active_usage() -> crate::Result<()> {
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("ngram")
+                .set_fieldnorms(false)
+                .set_index_option(IndexRecordOption::Basic),
+        );
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", text_options);
+        schema_builder.enable_user_specified_doc_id();
+        let tokenizers = TokenizerManager::default();
+        let ngram_tokenizer = TextAnalyzer::builder(NgramTokenizer::new(2, 3, false)?)
+            .dynamic()
+            .build();
+        tokenizers.register("ngram", ngram_tokenizer);
+        let mut writer = Index::builder()
+            .schema(schema_builder.build())
+            .tokenizers(tokenizers)
+            .single_segment_index_writer(RamDirectory::default(), MEMORY_BUDGET)?;
+
+        writer.add_documents_with_doc_ids(vec![
+            (3, doc!(text => "alphabet")),
+            (9, doc!(text => "alphanumeric")),
+        ])?;
+
+        let active_usage = writer.mem_usage();
+        let finalize_estimate = writer.estimated_finalize_base_mem_usage();
+        assert!(finalize_estimate > active_usage);
+        let soft_limit = active_usage + (finalize_estimate - active_usage) / 2;
+
+        assert!(active_usage <= soft_limit);
+        assert!(finalize_estimate > soft_limit);
+        writer.finalize()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_estimated_finalize_base_mem_usage_saturates_component_overflow() {
+        assert_eq!(
+            super::estimated_finalize_base_mem_usage_from_components(usize::MAX, 1, 1),
+            usize::MAX
+        );
+        assert_eq!(
+            super::estimated_finalize_base_mem_usage_from_components(0, usize::MAX, 0),
+            usize::MAX
+        );
+        assert_eq!(
+            super::estimated_finalize_base_mem_usage_from_components(0, 0, usize::MAX),
+            usize::MAX
+        );
+    }
+
+    #[test]
     fn test_document_error_is_returned_by_the_add_call() -> crate::Result<()> {
         let (number, mut writer) = schema_error_writer()?;
 
@@ -763,7 +907,7 @@ mod tests {
 
         assert_eq!(second_error.to_string(), first_error.to_string());
         assert_eq!(empty_batch_error.to_string(), first_error.to_string());
-        assert!(writer.segment_writer.is_none());
+        assert_eq!(writer.mem_usage(), 0);
 
         let finalize_error = match writer.finalize() {
             Ok(_) => {
@@ -797,7 +941,7 @@ mod tests {
             ])
             .expect_err("the schema error must be returned by the batch call");
         assert!(matches!(first_error, TantivyError::SchemaError(_)));
-        assert!(writer.segment_writer.is_none());
+        assert_eq!(writer.mem_usage(), 0);
 
         let finalize_error = match writer.finalize() {
             Ok(_) => {
@@ -881,6 +1025,21 @@ mod tests {
             .add_document(TantivyDocument::default())
             .expect_err("tokenizer panic must poison the writer");
         assert_eq!(second_error.to_string(), first_error.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn test_mem_usage_is_available_synchronously() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("text", TEXT);
+        let writer = Index::builder()
+            .schema(schema_builder.build())
+            .single_segment_index_writer::<TantivyDocument>(
+                RamDirectory::default(),
+                MEMORY_BUDGET,
+            )?;
+
+        assert!(writer.mem_usage() > 0);
         Ok(())
     }
 
